@@ -1,0 +1,309 @@
+"""
+boron_transport_solver.py
+
+Finite-volume 1D radial boron transport solver.
+
+This file is intentionally small and standalone.  The form is inspired by
+STRAHL/pySTRAHL impurity transport modeling, but it is not a replacement for
+a validated STRAHL workflow.  It is meant for a class-project / first-pass HSX
+boronization model where the uncertain transport coefficients are scanned.
+
+For each boron charge state, the model solves
+
+    dn_Z/dt = - div(Gamma_Z) + ionization/recombination coupling + source
+
+with
+
+    Gamma_Z = -D_Z(r) grad(n_Z) + V_Z(r) n_Z
+
+Sign convention:
+    V > 0 is outward radial convection.
+    V < 0 is inward radial convection.
+
+Boundary conditions:
+    r = 0      : symmetry — zero radial flux (face 0 excluded from loop).
+    outer edge : zero-gradient diffusion (dn/dr = 0 at LCFS, Neumann BC);
+                 convective outflow allowed when V[-1] > 0.
+                 NOTE: the Neumann outer BC is a standard first-pass choice.
+                 It can cause mild artificial density accumulation near the
+                 edge in early time.  It is not physically motivated by wall
+                 recycling conditions and should be acknowledged in any
+                 presentation.
+
+Numerics:
+    Convection is discretized with first-order upwinding, which introduces
+    numerical diffusion D_num ~ |V| * dr / 2.  For the default grids and
+    transport cases this is always << physical D.  It becomes relevant only
+    if D is pushed below ~1e-4 m^2/s (deep neoclassical regime).
+
+Units:
+    r: m
+    D: m^2/s
+    V: m/s
+    n_Z: m^-3
+    rates: s^-1
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+import numpy as np
+from scipy.integrate import solve_ivp
+
+
+@dataclass
+class BoronTransportResult:
+    """Container returned by solve_boron_transport."""
+    t: np.ndarray
+    rho: np.ndarray
+    r_m: np.ndarray
+    nZ: np.ndarray              # shape (nt, 6, nr)
+    D_m2_s: np.ndarray          # shape (6, nr)
+    V_m_s: np.ndarray           # shape (6, nr)
+    ionization_s: np.ndarray    # shape (nr, 5), B0->B1 through B4->B5
+    recombination_s: np.ndarray # shape (nr, 5), B1->B0 through B5->B4
+    source_m3_s: np.ndarray
+    metadata: dict
+
+
+def make_edge_neutral_source(
+    rho: np.ndarray,
+    total_particles_s: float,
+    minor_radius_m: float,
+    major_radius_m: float,
+    width: float = 0.035,
+    center: float = 0.98,
+) -> np.ndarray:
+    """
+    Convert a total boron atom source [particles/s] into a volume source
+    [m^-3 s^-1] localized near the edge.
+
+    This is NOT a neutral transport calculation.  It is a normalized Gaussian
+    source used to represent powder entering near the edge.  A future version
+    should replace this with a neutral deposition model or experimental
+    constraint from the dropper / spectroscopy.
+
+    Normalization: integral of S * dV over the torus equals total_particles_s,
+    where dV = 4 pi^2 R r dr (toroidal shell volume element).
+
+    The default total_particles_s = 1e20 s^-1 is an order-of-magnitude
+    placeholder.  It should be replaced with an estimate from powder dropper
+    calibration or boron spectroscopy before any quantitative comparison.
+    """
+    rho = np.asarray(rho, dtype=float)
+    r = rho * minor_radius_m
+
+    shape = np.exp(-0.5 * ((rho - center) / width) ** 2)
+    shape[rho < max(0.0, center - 5.0 * width)] = 0.0
+
+    # Toroidal shell volume: dV = 4*pi^2*R*r*dr.
+    dr = np.gradient(r)
+    r_safe = np.maximum(r, r[1] if len(r) > 1 else minor_radius_m / 100)
+    dV = 4.0 * np.pi**2 * major_radius_m * r_safe * dr
+
+    norm = np.sum(shape * dV)
+    if norm <= 0:
+        raise ValueError("Source normalization failed. Check source width/center.")
+    return total_particles_s * shape / norm
+
+
+def build_transport_matrix(r: np.ndarray, D: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """
+    Build the linear finite-volume radial transport operator:
+        dn/dt = -(1/r) d/dr [ r(-D dn/dr + V n) ]
+
+    Geometry: cylindrical minor-radius coordinate (toroidal 4 pi^2 R factor
+    cancels identically in numerator and denominator).
+        vol[i] = integral_{r_L}^{r_R} r dr = 0.5*(r_R^2 - r_L^2)
+        area   = r_face
+
+    A @ n returns the transport contribution to dn/dt [m^-3 s^-1].
+    """
+    r = np.asarray(r, dtype=float)
+    D = np.asarray(D, dtype=float)
+    V = np.asarray(V, dtype=float)
+
+    n = len(r)
+    if n < 4:
+        raise ValueError("Need at least 4 radial grid points.")
+    if D.shape != (n,) or V.shape != (n,):
+        raise ValueError("D and V must have shape (nr,).")
+
+    # Cell faces in the minor-radius coordinate.
+    rf = np.zeros(n + 1)
+    rf[1:-1] = 0.5 * (r[:-1] + r[1:])
+    rf[0] = 0.0
+    rf[-1] = r[-1] + 0.5 * (r[-1] - r[-2])
+
+    # vol[i] = integral r dr over cell i  (4 pi^2 R cancels in operator)
+    vol = 0.5 * (rf[1:]**2 - rf[:-1]**2)
+
+    A = np.zeros((n, n), dtype=float)
+
+    for face in range(1, n):
+        # face=0 is the axis (r=0) and is intentionally excluded, enforcing
+        # zero-flux symmetry at r=0.
+        iL, iR = face - 1, face
+        dr = r[iR] - r[iL]
+        if dr <= 0:
+            raise ValueError("Radial grid must be strictly increasing.")
+
+        Df = 0.5 * (D[iL] + D[iR])
+        Vf = 0.5 * (V[iL] + V[iR])
+        area = rf[face]
+
+        # Diffusive flux Gamma_D = -D (nR - nL)/dr.
+        A[iL, iL] += -area * ( Df / dr) / vol[iL]
+        A[iL, iR] += -area * (-Df / dr) / vol[iL]
+        A[iR, iL] +=  area * ( Df / dr) / vol[iR]
+        A[iR, iR] +=  area * (-Df / dr) / vol[iR]
+
+        # Convective flux Gamma_V = V n, first-order upwind at the face.
+        if Vf >= 0:
+            # outward flow: flux carried by left (inner) cell state
+            A[iL, iL] += -area * Vf / vol[iL]
+            A[iR, iL] +=  area * Vf / vol[iR]
+        else:
+            # inward flow: flux carried by right (outer) cell state
+            A[iL, iR] += -area * Vf / vol[iL]
+            A[iR, iR] +=  area * Vf / vol[iR]
+
+    # Outer edge: convective outflow only (Neumann diffusion BC => dn/dr=0).
+    # Inflow (V[-1] < 0) is blocked: no impurity enters from outside the LCFS.
+    face = n
+    area = rf[-1]
+    Vf = V[-1]
+    if Vf > 0:
+        A[-1, -1] += -area * Vf / vol[-1]
+
+    return A
+
+
+def solve_boron_transport(
+    rho: np.ndarray,
+    r_m: np.ndarray,
+    D_by_Z: np.ndarray,
+    V_by_Z: np.ndarray,
+    ionization_s: np.ndarray,
+    recombination_s: np.ndarray,
+    source_m3_s: np.ndarray,
+    t_end: float = 0.08,
+    n_save: int = 250,
+    metadata: dict | None = None,
+) -> BoronTransportResult:
+    """
+    Solve the coupled B0, B1+, ..., B5+ transport system.
+
+    Solver: BDF (L-stable implicit method) from scipy.integrate.solve_ivp.
+    BDF is required because electron-impact ionization of B0 gives timescales
+    of ~2 us at HSX core conditions, creating stiffness ratios ~10^4 over a
+    50 ms simulation.
+
+    Tolerances: rtol=1e-5, atol=1e-3 m^-3.  The 1e-3 m^-3 absolute floor is
+    many orders of magnitude below expected boron densities (10^15-10^18 m^-3).
+
+    Post-solve, negative densities (arising at roundoff level for a stiff
+    L-stable solver) are clipped to zero.  A warning is raised if the clipped
+    magnitude exceeds 1% of the peak density, which would indicate a genuine
+    solver accuracy problem rather than ordinary floating-point roundoff.
+    """
+    rho = np.asarray(rho, dtype=float)
+    r_m = np.asarray(r_m, dtype=float)
+    nr = len(rho)
+
+    D_by_Z = np.asarray(D_by_Z, dtype=float)
+    V_by_Z = np.asarray(V_by_Z, dtype=float)
+    iz = np.asarray(ionization_s, dtype=float)
+    rec = np.asarray(recombination_s, dtype=float)
+    source_m3_s = np.asarray(source_m3_s, dtype=float)
+
+    if D_by_Z.shape != (6, nr):
+        raise ValueError(f"D_by_Z should have shape (6,nr), got {D_by_Z.shape}")
+    if V_by_Z.shape != (6, nr):
+        raise ValueError(f"V_by_Z should have shape (6,nr), got {V_by_Z.shape}")
+    if iz.shape != (nr, 5):
+        raise ValueError(f"ionization_s should have shape (nr,5), got {iz.shape}")
+    if rec.shape != (nr, 5):
+        raise ValueError(f"recombination_s should have shape (nr,5), got {rec.shape}")
+    if source_m3_s.shape != (nr,):
+        raise ValueError(f"source_m3_s should have shape (nr,), got {source_m3_s.shape}")
+
+    # Pre-build transport matrices for all charge states.
+    A = [build_transport_matrix(r_m, D_by_Z[Z], V_by_Z[Z]) for Z in range(6)]
+
+    def rhs(t, y):
+        n = y.reshape(6, nr)
+        dn = np.zeros_like(n)
+
+        # Radial transport for each charge state.
+        for Z in range(6):
+            dn[Z] += A[Z] @ n[Z]
+
+        # Edge-localized neutral boron source applied to B0 only.
+        # Ions (Z >= 1) receive no direct source.
+        dn[0] += source_m3_s
+
+        # Electron-impact ionization: B^Z+ -> B^(Z+1)+.
+        # iz[:, Z] = rate coefficient * ne [s^-1] for ionising charge state Z.
+        # Conservation: every particle removed from Z is added to Z+1.
+        for Z in range(5):
+            rate = iz[:, Z]
+            dn[Z]     -= rate * n[Z]
+            dn[Z + 1] += rate * n[Z]
+
+        # Radiative / dielectronic recombination: B^(Z+1)+ -> B^Z+.
+        # rec[:, Z] = rate coefficient * ne [s^-1] for charge state Z+1.
+        # Conservation: every particle removed from Z+1 is added to Z.
+        # Charge-exchange recombination (which requires Ti) is NOT included.
+        for Z in range(5):
+            rate = rec[:, Z]
+            dn[Z + 1] -= rate * n[Z + 1]
+            dn[Z]     += rate * n[Z + 1]
+
+        return dn.ravel()
+
+    y0 = np.zeros((6, nr), dtype=float).ravel()
+    t_eval = np.linspace(0.0, t_end, n_save)
+
+    sol = solve_ivp(
+        rhs,
+        (0.0, t_end),
+        y0,
+        method="BDF",
+        t_eval=t_eval,
+        rtol=1e-5,
+        atol=1e-3,
+        max_step=t_end / 100.0,
+    )
+    if not sol.success:
+        raise RuntimeError(f"Transport solver failed: {sol.message}")
+
+    nZ_raw = sol.y.T.reshape(len(sol.t), 6, nr)
+
+    # Warn if negative densities are non-trivial before clipping.
+    min_val = nZ_raw.min()
+    if min_val < 0.0:
+        peak = np.abs(nZ_raw).max()
+        if peak > 0 and (-min_val) > 0.01 * peak:
+            warnings.warn(
+                f"Solver produced significant negative densities: "
+                f"min = {min_val:.2e} m^-3 ({-min_val / peak * 100:.1f}% of peak). "
+                "Consider tightening rtol/atol or inspecting transport coefficients.",
+                stacklevel=2,
+            )
+
+    nZ = np.maximum(nZ_raw, 0.0)
+
+    return BoronTransportResult(
+        t=sol.t,
+        rho=rho,
+        r_m=r_m,
+        nZ=nZ,
+        D_m2_s=D_by_Z,
+        V_m_s=V_by_Z,
+        ionization_s=iz,
+        recombination_s=rec,
+        source_m3_s=source_m3_s,
+        metadata=metadata or {},
+    )
